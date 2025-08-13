@@ -1,0 +1,656 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hamburglar Run — 32 Levels</title>
+<style>
+  html, body { height: 100%; margin: 0; background:#2a0040; }
+  canvas { display:block; margin:0 auto; background:#3b0a57; image-rendering: pixelated; }
+  #overlay {
+    position: fixed; inset: 0; pointer-events: none; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+    color: #f6e9ff; text-shadow: 0 2px 6px rgba(0,0,0,.5);
+  }
+  .hud { position: absolute; left: 16px; top: 12px; font-weight: 700; letter-spacing:.5px; font-size: 14px; }
+  .centerMsg { position:absolute; left:50%; top: 20px; transform: translateX(-50%); font-size: 14px; opacity:.9 }
+  .toast { position:absolute; right: 16px; top:12px; font-size: 14px; }
+  .big { font-size: 18px; }
+  a { color: #ffd8ff; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<div id="overlay" aria-live="polite">
+  <div class="hud" id="hud"></div>
+  <div class="centerMsg" id="msg"></div>
+  <div class="toast" id="toast"></div>
+</div>
+<script>
+(() => {
+  'use strict';
+
+  // ====== Canvas & Context ======
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // Hi-DPI scaling
+  const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  canvas.width = 960 * DPR;
+  canvas.height = 540 * DPR;
+  canvas.style.width = '960px';
+  canvas.style.height = '540px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  // ====== UI Elements ======
+  const hud = document.getElementById('hud');
+  const msg = document.getElementById('msg');
+  const toast = document.getElementById('toast');
+
+  // ====== Helpers ======
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const rand = (a, b) => Math.random() * (b - a) + a;
+  const randi = (a, b) => Math.floor(rand(a, b));
+  const sign = v => (v < 0 ? -1 : 1);
+
+  // ====== World / Camera ======
+  const VIEW_W = 960, VIEW_H = 540;
+  const G = 1800;           // gravity px/s^2
+  const MOVE = 500;         // run speed px/s
+  const JUMP = 700;         // jump impulse
+  const AIR_CTRL = 0.85;    // less control in air
+  const FRICTION = 1600;    // ground friction
+  const TILE = 48;          // base tile size for platforms/metrics
+
+  // ====== Game State ======
+  let levelNum = 1;
+  const MAX_LEVEL = 32;
+  let level, player, camera, solids=[], enemies=[], burgers=[], drinks=[], goal, particles=[];
+  let keys = new Set();
+  let paused = false;
+  let muted = false;
+  let tLast = 0;
+  let deaths = 0;
+  let totalBurgers = 0;
+  let collectedBurgers = 0;
+
+  // ====== Sounds (tiny synth beeps) ======
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  function beep(freq=440, dur=0.08, type='square', vol=0.03) {
+    if (muted) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.value = vol;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start();
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.stop(audioCtx.currentTime + dur + 0.02);
+  }
+  const sfx = {
+    jump(){ beep(760, .1, 'square', .05); },
+    stomp(){ beep(220, .06, 'sawtooth', .04); },
+    hit(){ beep(110, .2, 'square', .06); },
+    burger(){ beep(880, .05, 'triangle', .05); },
+    drink(){ beep(540, .12, 'sine', .06); },
+    win(){ [880,988,1174].forEach((f,i)=>setTimeout(()=>beep(f,.12,'triangle',.06), i*110)); },
+    level(){ [660,880].forEach((f,i)=>setTimeout(()=>beep(f,.09,'sine',.05), i*90)); }
+  };
+
+  // ====== Entities ======
+  function rect(x,y,w,h){ return {x,y,w,h}; }
+  function aabb(a,b){ return !(a.x+a.w<=b.x || a.x>=b.x+b.w || a.y+a.h<=b.y || a.y>=b.y+b.h); }
+
+  function makePlayer(spawnX, spawnY){
+    return {
+      x: spawnX, y: spawnY, w: 28, h: 38,
+      vx: 0, vy: 0, onGround:false, dir:1,
+      big:false, invuln:0, spawnX, spawnY
+    };
+  }
+
+  function makeEnemy(x,y,range,speed){
+    return { x, y, w: 40, h: 40, vx: speed, vy: 0, left:x-range, right:x+range, alive:true };
+  }
+
+  function makeBurger(x,y){ return { x, y, w: 26, h: 20, taken:false }; }
+  function makeDrink(x,y){ return { x, y, w: 22, h: 28, taken:false }; }
+
+  function makeGoal(x,y){ return { x, y, w: 40, h: 80 }; }
+
+  // ====== Particles ======
+  function addParticles(x,y,n=8,spd=200,life=0.4){
+    for(let i=0;i<n;i++){
+      const a = rand(0,Math.PI*2), v = rand(spd*.4, spd);
+      particles.push({x,y, vx:Math.cos(a)*v, vy:Math.sin(a)*v, t:life});
+    }
+  }
+
+  // ====== Procedural Level Generator (32 distinct seeds) ======
+  function buildLevel(n){
+    const rngSeed = n * 9973;
+    let seed = rngSeed;
+    const randSeed = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 0xFFFFFFFF;
+
+    const lengthScreens = clamp(6 + Math.floor(n*0.6), 6, 28);   // how many screens wide
+    const L = lengthScreens * VIEW_W;
+    const groundY = 420;
+
+    solids = [];
+    enemies = [];
+    burgers = [];
+    drinks = [];
+
+    // Ground segments with gaps
+    let x = 0;
+    while (x < L){
+      const gap = (randSeed() < 0.18 + n*0.004) ? randi(TILE*2, TILE*4) : 0;
+      const seg = randi(TILE*6, TILE*14);
+      if (gap && x>0) x += gap;
+      solids.push(rect(x, groundY, seg, VIEW_H-groundY+200));
+      x += seg;
+    }
+
+    // Floating platforms
+    const platCount = Math.floor(lengthScreens* (2.2 + n*0.15));
+    for (let i=0;i<platCount;i++){
+      const pw = randi(TILE*2, TILE*4);
+      const px = randi(TILE*1, L - TILE*3);
+      const py = groundY - randi(TILE*3, TILE*8);
+      solids.push(rect(px, py, pw, TILE*0.75));
+      if (randSeed() < 0.35) solids.push(rect(px + randi(-TILE, TILE), py - randi(TILE*2, TILE*4), randi(TILE*2, TILE*3), TILE*0.75));
+    }
+
+    // Ladders / safety steps (rare)
+    if (n <= 6){
+      for (let i=0;i<4;i++){
+        const px = randi(TILE*2, L - TILE*3);
+        const steps = randi(2,4);
+        for (let s=0;s<steps;s++){
+          solids.push(rect(px + s*TILE*1.2, groundY - (s+1)*TILE, TILE, TILE*0.6));
+        }
+      }
+    }
+
+    // Enemies scale up with level
+    const enemyCount = Math.floor(lengthScreens * (1.2 + n*0.35));
+    for (let i=0;i<enemyCount;i++){
+      const ex = randi(TILE*2, L - TILE*3);
+      const ey = groundY - 40;
+      const patrol = randi(TILE*2, TILE*6);
+      const speed = randSeed() * (50 + n*4) + 35;
+      enemies.push(makeEnemy(ex, ey, patrol, speed * (randSeed()<.5?-1:1)));
+    }
+
+    // Burgers (collectibles)
+    totalBurgers = 0;
+    const burgerCount = Math.floor(lengthScreens * 3);
+    for (let i=0;i<burgerCount;i++){
+      const bx = randi(TILE*1, L - TILE*3);
+      const by = groundY - randi(TILE*2, TILE*8);
+      burgers.push(makeBurger(bx, by));
+      totalBurgers++;
+    }
+
+    // Drinks (powerups)
+    const drinkCount = Math.max(1, Math.floor(lengthScreens * (0.5 + n*0.05)));
+    for (let i=0;i<drinkCount;i++){
+      const dx = randi(TILE*2, L - TILE*3);
+      const dy = groundY - randi(TILE*2, TILE*7);
+      drinks.push(makeDrink(dx, dy));
+    }
+
+    // Goal near the end, slightly elevated
+    goal = makeGoal(L - TILE*3, groundY - 80);
+
+    // Player spawn
+    player = makePlayer(TILE*2, groundY - 40);
+
+    // Camera
+    camera = { x: 0, y: 0, w: VIEW_W, h: VIEW_H, lerp: 0.12 };
+
+    level = { L, groundY, n };
+  }
+
+  // ====== Input ======
+  const onKey = (e, down) => {
+    if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' ','Space','KeyA','KeyD','KeyW','KeyR','KeyP','KeyM'].includes(e.code)) {
+      e.preventDefault();
+    }
+    if (down) keys.add(e.code); else keys.delete(e.code);
+    if (down && (e.code === 'KeyP')) { paused = !paused; }
+    if (down && (e.code === 'KeyM')) { muted = !muted; beep(400,.05); }
+    if (down && (e.code === 'KeyR')) { respawn(true); }
+  };
+  window.addEventListener('keydown', e => {
+    // Resume audio context on first interaction (autoplay policies)
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    onKey(e, true);
+  });
+  window.addEventListener('keyup', e => onKey(e, false));
+
+  // ====== Physics & Collision ======
+  function moveAndCollide(entity, dt){
+    // Apply gravity
+    entity.vy += G * dt;
+
+    let nextX = entity.x + entity.vx * dt;
+    let nextY = entity.y + entity.vy * dt;
+
+    // Horizontal
+    const bboxX = rect(Math.min(entity.x, nextX), entity.y, entity.w + Math.abs(entity.vx*dt), entity.h);
+    for (const s of solids){
+      if (aabb(bboxX, s)){
+        if (entity.vx > 0) nextX = Math.min(nextX, s.x - entity.w);
+        else if (entity.vx < 0) nextX = Math.max(nextX, s.x + s.w);
+        entity.vx = 0;
+      }
+    }
+    entity.x = nextX;
+
+    // Vertical
+    entity.onGround = false;
+    const bboxY = rect(entity.x, Math.min(entity.y, nextY), entity.w, entity.h + Math.abs(entity.vy*dt));
+    for (const s of solids){
+      if (aabb(bboxY, s)){
+        if (entity.vy > 0){ // down
+          nextY = Math.min(nextY, s.y - entity.h);
+          entity.onGround = true;
+        } else if (entity.vy < 0){ // up
+          nextY = Math.max(nextY, s.y + s.w ? s.y + s.h : s.y); // safeguard
+        }
+        entity.vy = 0;
+      }
+    }
+    entity.y = nextY;
+  }
+
+  function applyFriction(e, dt){
+    if (e.onGround){
+      if (Math.abs(e.vx) <= FRICTION*dt) e.vx = 0;
+      else e.vx -= FRICTION * dt * sign(e.vx);
+    }
+  }
+
+  // ====== Gameplay ======
+  function updatePlayer(dt){
+    const left = keys.has('ArrowLeft') || keys.has('KeyA');
+    const right = keys.has('ArrowRight') || keys.has('KeyD');
+    const jumpKey = keys.has('ArrowUp') || keys.has('KeyW') || keys.has('Space');
+
+    const accel = player.onGround ? MOVE : MOVE*AIR_CTRL;
+    if (left) player.vx = -accel;
+    if (right) player.vx = accel;
+    if (left === right) { // none or both
+      applyFriction(player, dt);
+    }
+    if (right) player.dir = 1; else if (left) player.dir = -1;
+
+    // Jump: coyote time & buffering (simple)
+    player._coyote = (player.onGround ? 0.1 : Math.max(0, (player._coyote||0) - dt));
+    player._jumpBuf = (jumpKey ? 0.12 : Math.max(0, (player._jumpBuf||0) - dt));
+
+    // After moving with gravity, we’ll check for onGround and then trigger jump
+    moveAndCollide(player, dt);
+
+    if (player._jumpBuf>0 && (player.onGround || player._coyote>0)){
+      player.vy = -JUMP * (player.big ? 1.05 : 1);
+      player.onGround = false;
+      player._jumpBuf = 0;
+      sfx.jump();
+    }
+
+    // Invulnerability timer
+    if (player.invuln > 0) player.invuln -= dt;
+
+    // World bounds
+    player.x = clamp(player.x, -TILE*2, level.L + TILE*2);
+    if (player.y > level.groundY + 300){
+      respawn();
+    }
+
+    // Collect burgers
+    for (const b of burgers){
+      if (!b.taken && aabb(player, b)){
+        b.taken = true;
+        collectedBurgers++;
+        addParticles(b.x+b.w/2, b.y+b.h/2, 12, 260, .45);
+        sfx.burger();
+        toastFlash(`🍔 +1 burger (${collectedBurgers}/${totalBurgers})`);
+      }
+    }
+
+    // Collect drinks (powerup)
+    for (const d of drinks){
+      if (!d.taken && aabb(player, d)){
+        d.taken = true;
+        powerUp();
+      }
+    }
+
+    // Enemy interactions
+    for (const en of enemies){
+      if (!en.alive) continue;
+
+      // Simple patrol & gravity
+      en.vy += G * dt;
+      en.x += en.vx * dt;
+      en.y += en.vy * dt;
+
+      // Collide with ground/platforms
+      // Horizontal
+      for (const s of solids){
+        if (aabb(rect(en.x, en.y, en.w, en.h), s)){
+          // resolve vertical first
+          const prevY = en.y - en.vy * dt;
+          if (prevY + en.h <= s.y){
+            en.y = s.y - en.h; en.vy = 0;
+          } else {
+            // horizontal hit, flip direction
+            if (en.vx > 0) en.x = s.x - en.w;
+            else en.x = s.x + s.w;
+            en.vx *= -1;
+          }
+        }
+      }
+
+      // Patrol bounds
+      if (en.x < en.left) { en.x = en.left; en.vx = Math.abs(en.vx); }
+      if (en.x > en.right) { en.x = en.right; en.vx = -Math.abs(en.vx); }
+
+      // Player vs enemy
+      if (aabb(player, en)){
+        const stomped = (player.vy > 120) && (player.y + player.h - en.y < 18);
+        if (stomped){
+          en.alive = false;
+          player.vy = -JUMP * 0.6;
+          sfx.stomp();
+          addParticles(en.x+en.w/2, en.y+en.h/2, 18, 320, .5);
+        } else {
+          playerHit();
+        }
+      }
+    }
+
+    // Level goal
+    if (aabb(player, goal)){
+      levelComplete();
+    }
+
+    // Camera follow
+    const targetX = clamp(player.x + player.w/2 - VIEW_W/2, 0, level.L - VIEW_W);
+    const targetY = 0;
+    camera.x += (targetX - camera.x) * camera.lerp;
+    camera.y += (targetY - camera.y) * camera.lerp;
+  }
+
+  function powerUp(){
+    if (!player.big){
+      player.big = true;
+      // Grow from center bottom
+      const oldH = player.h;
+      player.h = 54; player.w = 34;
+      player.y -= (player.h - oldH);
+    } else {
+      // Already big -> grant brief invulnerability
+      player.invuln = 2.0;
+    }
+    addParticles(player.x+player.w/2, player.y, 24, 360, .6);
+    sfx.drink();
+    toastFlash('🥤 Power up! Big Burglar');
+  }
+
+  function playerHit(){
+    if (player.invuln > 0) return;
+    if (player.big){
+      player.big = false;
+      // shrink
+      const oldH = player.h;
+      player.h = 38; player.w = 28;
+      player.y += (oldH - player.h);
+      player.invuln = 1.2;
+      sfx.hit();
+      addParticles(player.x+player.w/2, player.y+player.h/2, 24, 280, .5);
+      toastFlash('Ouch! Lost your drink.');
+    } else {
+      deaths++;
+      sfx.hit();
+      respawn();
+    }
+  }
+
+  function respawn(manual=false){
+    // Reset player and enemies, keep collected burgers
+    player = makePlayer(player.spawnX, player.spawnY);
+    for (const en of enemies){
+      // reset alive status for fairness on death
+      en.alive = true;
+    }
+    if (!manual) toastFlash('☠️ You fell! Respawned.');
+  }
+
+  function levelComplete(){
+    sfx.win();
+    levelNum++;
+    if (levelNum > MAX_LEVEL){
+      msg.innerHTML = `🎉 <span class="big">You beat all ${MAX_LEVEL} levels!</span> Burgers: ${collectedBurgers}/${totalBurgers} on last level · Total deaths: ${deaths}<br/>
+      Press <b>R</b> to replay last level or refresh to start over.`;
+      paused = true;
+      return;
+    }
+    msg.innerHTML = `Level ${levelNum-1} complete! ➜ Level ${levelNum}`;
+    setTimeout(() => { buildLevel(levelNum); sfx.level(); msg.textContent=''; }, 600);
+  }
+
+  // ====== Drawing ======
+  function drawBackground(){
+    // Purple gradient sky
+    const g = ctx.createLinearGradient(0,0,0,VIEW_H);
+    g.addColorStop(0, '#5d1e80');
+    g.addColorStop(1, '#2d0a3f');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,VIEW_W,VIEW_H);
+
+    // Subtle stars/dots
+    ctx.globalAlpha = 0.15;
+    for(let i=0;i<50;i++){
+      const x = (i*131 % VIEW_W);
+      const y = (i*79 % VIEW_H * 0.6) | 0;
+      ctx.fillRect(x, y, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawSolids(){
+    ctx.fillStyle = '#7c3aa8';
+    ctx.strokeStyle = '#a86ad7';
+    for (const s of solids){
+      const sx = s.x - camera.x, sy = s.y - camera.y;
+      if (sx+s.w<0 || sx>VIEW_W) continue;
+      // top bevel
+      ctx.fillStyle = '#6a2a95';
+      ctx.fillRect(sx, sy, s.w, 6);
+      // body
+      ctx.fillStyle = '#7c3aa8';
+      ctx.fillRect(sx, sy+6, s.w, s.h-6);
+      // outline
+      ctx.globalAlpha = .4;
+      ctx.strokeRect(sx+.5, sy+.5, s.w-1, s.h-1);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawPlayer(){
+    const p = player;
+    const x = Math.round(p.x - camera.x), y = Math.round(p.y - camera.y);
+    // Shadow
+    ctx.globalAlpha = .2;
+    ctx.beginPath(); ctx.ellipse(x+p.w/2, y+p.h, p.w*.6, 6, 0, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Body (striped burglar outfit)
+    ctx.fillStyle = '#111';
+    ctx.fillRect(x, y+6, p.w, p.h-6);
+    ctx.fillStyle = '#eee';
+    for(let i=0;i<4+(p.big?2:0);i++){
+      const yy = y+8 + i*10;
+      ctx.fillRect(x+2, yy, p.w-4, 5);
+    }
+
+    // Cape-ish red tie
+    ctx.fillStyle = '#f24e4e';
+    ctx.fillRect(x+p.w/2-3, y+4, 6, 10);
+
+    // Head
+    ctx.fillStyle = '#f6d6b8';
+    ctx.fillRect(x+4, y-10, p.w-8, 14);
+    // Mask
+    ctx.fillStyle = '#000';
+    ctx.fillRect(x+6, y-6, p.w-12, 6);
+
+    // Hat
+    ctx.fillStyle = '#111';
+    ctx.fillRect(x-2, y-14, p.w+4, 4);
+    ctx.fillRect(x+4, y-20, p.w-8, 6);
+
+    // Facing indicator
+    ctx.fillStyle = '#ddd';
+    const eyeX = p.dir>0 ? x+p.w-10 : x+8;
+    ctx.fillRect(eyeX, y-4, 3, 2);
+
+    // Flicker if invulnerable
+    if (p.invuln > 0){
+      ctx.globalAlpha = 0.4 + 0.6*Math.sin(Date.now()/50);
+      ctx.strokeStyle = '#ffd8ff';
+      ctx.strokeRect(x-2.5, y-2.5, p.w+5, p.h+5);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawEnemies(){
+    for (const e of enemies){
+      if (!e.alive) continue;
+      const x = Math.round(e.x - camera.x), y = Math.round(e.y - camera.y);
+      if (x+e.w<0 || x>VIEW_W) continue;
+      // Grimace-y blob
+      ctx.fillStyle = '#8a49cf';
+      ctx.fillRect(x, y, e.w, e.h);
+      ctx.fillStyle = '#b884ff';
+      ctx.fillRect(x+4, y+4, e.w-8, e.h-12);
+      // Eyes
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(x+10, y+10, 6, 6);
+      ctx.fillRect(x+e.w-16, y+10, 6, 6);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(x+12, y+12, 2, 2);
+      ctx.fillRect(x+e.w-14, y+12, 2, 2);
+      // Feet line
+      ctx.fillStyle = '#6926a4';
+      ctx.fillRect(x+2, y+e.h-6, e.w-4, 4);
+    }
+  }
+
+  function drawItems(){
+    for (const b of burgers){
+      if (b.taken) continue;
+      const x = Math.round(b.x - camera.x), y = Math.round(b.y - camera.y);
+      if (x+30<0 || x>VIEW_W) continue;
+      // Burger (bun-cheese-patty-bun)
+      ctx.fillStyle = '#ffcd75'; ctx.fillRect(x, y, 26, 8); // top bun
+      ctx.fillStyle = '#ffeaa7'; ctx.fillRect(x, y+8, 26, 3); // sesame
+      ctx.fillStyle = '#f7d84c'; ctx.fillRect(x+2, y+11, 22, 3); // cheese
+      ctx.fillStyle = '#5b2b14'; ctx.fillRect(x+2, y+14, 22, 4); // patty
+      ctx.fillStyle = '#ffcd75'; ctx.fillRect(x, y+18, 26, 4); // bottom bun
+    }
+    for (const d of drinks){
+      if (d.taken) continue;
+      const x = Math.round(d.x - camera.x), y = Math.round(d.y - camera.y);
+      if (x+26<0 || x>VIEW_W) continue;
+      // Drink cup
+      ctx.fillStyle = '#d4c6ff'; ctx.fillRect(x, y, 22, 24);
+      ctx.fillStyle = '#b499ff'; ctx.fillRect(x, y+18, 22, 6);
+      // Straw
+      ctx.fillStyle = '#fff'; ctx.fillRect(x+9, y-8, 4, 8);
+      ctx.fillStyle = '#f24e4e'; ctx.fillRect(x+9, y-8, 4, 2);
+    }
+  }
+
+  function drawGoal(){
+    const g = goal;
+    const x = Math.round(g.x - camera.x), y = Math.round(g.y - camera.y);
+    // Glowing purple door/portal
+    ctx.fillStyle = '#b884ff';
+    ctx.fillRect(x, y, g.w, g.h);
+    ctx.fillStyle = '#2d0a3f';
+    ctx.fillRect(x+6, y+8, g.w-12, g.h-16);
+    ctx.globalAlpha = .3;
+    ctx.fillStyle = '#d8b5ff';
+    ctx.fillRect(x-6, y-6, g.w+12, g.h+12);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawParticles(dt){
+    for (let i=particles.length-1;i>=0;i--){
+      const p = particles[i];
+      p.t -= dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 600*dt;
+      if (p.t <= 0){ particles.splice(i,1); continue; }
+      const x = Math.round(p.x - camera.x), y = Math.round(p.y - camera.y);
+      ctx.globalAlpha = clamp(p.t*2, 0, 1);
+      ctx.fillStyle = '#ffd8ff';
+      ctx.fillRect(x, y, 3, 3);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function draw(){
+    drawBackground();
+    ctx.save();
+    // world
+    drawSolids();
+    drawItems();
+    drawEnemies();
+    drawGoal();
+    drawPlayer();
+    drawParticles(dt); // uses dt from main loop scope
+    ctx.restore();
+  }
+
+  // ====== HUD / UI ======
+  function updateHUD(){
+    hud.innerHTML = `Level <b>${levelNum}/${MAX_LEVEL}</b> &nbsp;|&nbsp; 🍔 Burgers: <b>${burgers.filter(b=>b.taken).length}/${totalBurgers}</b> &nbsp;|&nbsp; ☠️ Deaths: <b>${deaths}</b> &nbsp;|&nbsp; ${player.big?'🥤 BIG':'🥤 small'} &nbsp;|&nbsp; ${paused?'⏸ paused':'▶️ playing'} &nbsp;|&nbsp; 🔊 ${muted?'muted':'on'}<br/>
+    Move: A/D or ←/→ &nbsp;•&nbsp; Jump: W/↑/Space &nbsp;•&nbsp; R: restart &nbsp;•&nbsp; P: pause &nbsp;•&nbsp; M: mute`;
+  }
+  let toastTimer = 0;
+  function toastFlash(text){
+    toast.textContent = text;
+    toastTimer = 1.5;
+  }
+
+  // ====== Game Loop ======
+  let dt = 0;
+  function loop(tNow){
+    if (!tLast) tLast = tNow;
+    dt = Math.min(1/30, (tNow - tLast) / 1000); // clamp dt
+    tLast = tNow;
+
+    if (!paused){
+      updatePlayer(dt);
+      if (toastTimer > 0){ toastTimer -= dt; if (toastTimer <= 0) toast.textContent=''; }
+    }
+
+    updateHUD();
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // ====== Start ======
+  buildLevel(levelNum);
+  sfx.level();
+  requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
